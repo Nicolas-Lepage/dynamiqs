@@ -18,7 +18,7 @@ from .qarrays.layout import Layout, dia, promote_layouts
 from .qarrays.qarray import QArray, QArrayLike, isqarraylike
 from .qarrays.utils import asqarray
 
-__all__ = ['TimeQArray', 'constant', 'modulated', 'pwc', 'timecallable']
+__all__ = ['TimeQArray', 'constant', 'modulated', 'pwc', 'singlesquarepulse', 'timecallable']
 
 
 def constant(qarray: QArrayLike) -> ConstantTimeQArray:
@@ -119,6 +119,79 @@ def pwc(times: ArrayLike, values: ArrayLike, qarray: QArrayLike) -> PWCTimeQArra
     check_shape(qarray, 'qarray', '(n, n)')
 
     return PWCTimeQArray(times, values, qarray)
+
+
+def singlesquarepulse(times: ArrayLike, values: ArrayLike, qarray: QArrayLike) -> ssTimeQArray:
+    r"""Instantiate a single square piecewise constant (ssp) timeqarray.
+
+    A ssp timeqarray takes a constant value over a single time interval. It is defined by
+    $$
+        O(t) = c\; \Omega_{[t_k, t_{k+1}[}(t) O_0
+    $$
+    where $c$ is a constant value, $\Omega_{[t_k, t_{k+1}[}$ is the rectangular
+    window function defined by $\Omega_{[t_a, t_b[}(t) = 1$ if $t \in [t_a, t_b[$ and
+    $\Omega_{[t_a, t_b[}(t) = 0$ otherwise, and $O_0$ is a constant qarray.
+
+    Note:
+        The argument `times` must be sorted in ascending order and of size 2
+
+    Note:
+        If the returned timeqarray is called for a time $t$ which does not belong to
+        the time interval, the returned qarray is null.
+
+    Args:
+        times (array-like of shape (2,)): Time points $t_0$ and $t_1$ defining the boundaries of the single time interval.
+        values (array-like of shape (..., 1)): Constant value $c$ for the time interval.
+        qarray (qarray-like of shape (n, n)): Constant qarray $O_0$.
+
+    Returns:
+        (timeqarray of shape (..., n, n) when called): Callable returning $O(t)$ for
+            any time $t$.
+
+    Examples:
+        >>> times = [0.0, 1.0]
+        >>> values = [3.0]
+        >>> qarray = dq.sigmaz()
+        >>> H = dq.singlesquarepulse(times, values, qarray)
+        >>> H(-0.5)
+        QArray: shape=(2, 2), dims=(2,), dtype=complex64, layout=dia, ndiags=1
+        [[  ⋅      ⋅   ]
+         [  ⋅      ⋅   ]]
+        >>> H(0.0)
+        QArray: shape=(2, 2), dims=(2,), dtype=complex64, layout=dia, ndiags=1
+        [[ 3.+0.j    ⋅   ]
+         [   ⋅    -3.+0.j]]
+        >>> H(0.5)
+        QArray: shape=(2, 2), dims=(2,), dtype=complex64, layout=dia, ndiags=1
+        [[ 3.+0.j    ⋅   ]
+         [   ⋅    -3.+0.j]]
+        >>> H(1.0)
+        QArray: shape=(2, 2), dims=(2,), dtype=complex64, layout=dia, ndiags=1
+        [[  ⋅      ⋅   ]
+         [  ⋅      ⋅   ]]
+    """
+    # times
+    times = jnp.asarray(times)
+    if times.shape[0] != 2:
+        raise TypeError(
+            'Argument `times` must have shape `(2,)`, but has shape'
+            f' `{times.shape}.'
+        )
+    times = check_times(times, 'times')
+
+    # values
+    values = jnp.asarray(values, dtype=cdtype())
+    if values.shape[-1] != 1:
+        raise TypeError(
+            'Argument `values` must have shape `(...,1)`, but has shape'
+            f' `{values.shape}.'
+        )
+
+    # qarray
+    qarray = asqarray(qarray)
+    check_shape(qarray, 'qarray', '(n, n)')
+
+    return ssTimeQArray(times, values, qarray)
 
 
 def modulated(
@@ -568,6 +641,98 @@ class ConstantTimeQArray(TimeQArray):
 
         return super().__add__(y)
 
+class ssTimeQArray(TimeQArray):
+    # note: tstart and tend can be different from times[0] and times[-1]
+
+    times: Array  # (2,)
+    values: Array  # (..., 1)
+    qarray: QArray  # (n, n)
+
+    def __init__(
+        self,
+        times: Array,
+        values: Array,
+        qarray: QArray,
+        *,
+        tstart: float | None = None,
+        tend: float | None = None,
+    ):
+        super().__init__(tstart=tstart, tend=tend)
+        self.times = times
+        self.values = values
+        self.qarray = qarray
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return self.qarray.dtype
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return *self.values.shape[:-1], *self.qarray.shape
+
+    @property
+    def dims(self) -> tuple[int, ...]:
+        return self.qarray.dims
+
+    @property
+    def ndiags(self) -> int:
+        return self.qarray.ndiags
+
+    @property
+    def vectorized(self) -> bool:
+        return self.qarray.vectorized
+
+    @property
+    def layout(self) -> Layout:
+        return self.qarray.layout
+
+    @property
+    def mT(self) -> TimeQArray:
+        qarray = self.qarray.mT
+        return replace(self, qarray=qarray)  # ty: ignore[invalid-argument-type]
+
+    @property
+    def in_axes(self) -> PyTree[int | None]:
+        return ssTimeQArray(None, 0, None, tstart=None, tend=None)
+
+    @property
+    def discontinuity_ts(self) -> Array:
+        return concatenate_sort(super().discontinuity_ts, self.times)
+
+    def shift(self, tshift: float) -> TimeQArray:
+        tstart, tend = self._shift_bounds(tshift)
+        return replace(self, times=self.times + tshift, tstart=tstart, tend=tend)  # ty: ignore[invalid-argument-type]
+
+    def reshape(self, *shape: int) -> TimeQArray:
+        shape = shape[:-2] + self.values.shape[-1:]  # (..., nv)
+        values = self.values.reshape(*shape)
+        return replace(self, values=values)  # ty: ignore[invalid-argument-type]
+
+    def broadcast_to(self, *shape: int) -> TimeQArray:
+        shape = shape[:-2] + self.values.shape[-1:]  # (..., nv)
+        values = jnp.broadcast_to(self.values, shape)
+        return replace(self, values=values)  # ty: ignore[invalid-argument-type]
+
+    def conj(self) -> TimeQArray:
+        values = self.values.conj()
+        qarray = self.qarray.conj()
+        return replace(self, values=values, qarray=qarray)  # ty: ignore[invalid-argument-type]
+
+    def _prefactor(self, t: ScalarLike) -> Array:
+        zero = jnp.zeros_like(self.values[..., 0])  # (...)
+
+        pwc_prefactor = jax.lax.select(
+            (t < self.times[0]) | (t >= self.times[-1]), zero, self.values[..., 0]
+        )
+
+        return super()._prefactor(t) * pwc_prefactor
+
+    def _operator(self, t: ScalarLike) -> QArray:  # noqa: ARG002
+        return self.qarray
+
+    def __mul__(self, y: QArrayLike) -> TimeQArray:
+        qarray = self.qarray * y
+        return replace(self, qarray=qarray)  # ty: ignore[invalid-argument-type]
 
 class PWCTimeQArray(TimeQArray):
     # note: tstart and tend can be different from times[0] and times[-1]
