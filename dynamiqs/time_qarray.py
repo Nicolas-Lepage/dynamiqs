@@ -18,7 +18,7 @@ from .qarrays.layout import Layout, dia, promote_layouts
 from .qarrays.qarray import QArray, QArrayLike, isqarraylike
 from .qarrays.utils import asqarray
 
-__all__ = ['TimeQArray', 'constant', 'modulated', 'pwc', 'singlesquarepulse', 'timecallable']
+__all__ = ['TimeQArray', 'constant', 'modulated', 'pwc', 'singlesquarepulse', 'timecallable', 'vectorizedsinglesquarepulses']
 
 
 def constant(qarray: QArrayLike) -> ConstantTimeQArray:
@@ -192,6 +192,85 @@ def singlesquarepulse(times: ArrayLike, values: ArrayLike, qarray: QArrayLike) -
     check_shape(qarray, 'qarray', '(n, n)')
 
     return ssTimeQArray(times, values, qarray)
+
+
+def vectorizedsinglesquarepulses(
+    times: ArrayLike, values: ArrayLike, qarray: QArrayLike
+) -> VectorizedSSPTimeQArray:
+    r"""Instantiate a vectorized sum of square pulses (VSP) timeqarray.
+
+    A VSP timeqarray represents a piecewise-constant signal as a sum of N non-
+    overlapping square pulses, but stores all pulse windows and values in stacked
+    arrays and evaluates them in a single parallel reduction instead of N separate
+    branches. This gives O(1) compiled code size regardless of N, unlike building
+    a sum of N :func:`singlesquarepulse` objects.
+
+    It is mathematically equivalent to :func:`pwc` but uses a vectorized window
+    comparison instead of a binary search (``searchsorted``)::
+
+        O(t) = \left(\sum_{k=0}^{N-1} c_k\; \Omega_{[t_k, t_{k+1}[}(t)\right) O_0
+
+    where the sum is evaluated as ``jnp.sum(values * active_mask, axis=-1)``
+    with ``active_mask`` computed in a single broadcast comparison over all N
+    windows at once.
+
+    Note:
+        The argument `times` must be sorted in ascending order, but intervals
+        do **not** need to be contiguous (gaps are simply zero).
+
+    Note:
+        If the returned timeqarray is called for a time $t$ which does not belong to
+        any time interval, the returned qarray is null.
+
+    Args:
+        times (array-like of shape (N+1,)): Time points $t_k$ defining the boundaries
+            of the N time intervals.
+        values (array-like of shape (..., N)): Constant values $c_k$ for each
+            interval.
+        qarray (qarray-like of shape (n, n)): Constant qarray $O_0$.
+
+    Returns:
+        (timeqarray of shape (..., n, n) when called): Callable returning $O(t)$ for
+            any time $t$.
+
+    Examples:
+        >>> times = [0.0, 1.0, 2.0]
+        >>> values = [3.0, -2.0]
+        >>> qarray = dq.sigmaz()
+        >>> H = dq.vectorizedsinglesquarepulses(times, values, qarray)
+        >>> H(-0.5)
+        QArray: shape=(2, 2), dims=(2,), dtype=complex64, layout=dia, ndiags=1
+        [[  ⋅      ⋅   ]
+         [  ⋅      ⋅   ]]
+        >>> H(0.0)
+        QArray: shape=(2, 2), dims=(2,), dtype=complex64, layout=dia, ndiags=1
+        [[ 3.+0.j    ⋅   ]
+         [   ⋅    -3.+0.j]]
+        >>> H(1.0)
+        QArray: shape=(2, 2), dims=(2,), dtype=complex64, layout=dia, ndiags=1
+        [[-2.+0.j    ⋅   ]
+         [   ⋅     2.+0.j]]
+    """
+    # times
+    times = jnp.asarray(times)
+    times = check_times(times, 'times')
+
+    # values
+    values = jnp.asarray(values, dtype=cdtype())
+    if values.shape[-1] != len(times) - 1:
+        raise TypeError(
+            'Argument `values` must have shape `(..., len(times)-1)`, but has shape'
+            f' `{values.shape}.'
+        )
+
+    # qarray
+    qarray = asqarray(qarray)
+    check_shape(qarray, 'qarray', '(n, n)')
+
+    # Build stacked windows: all_times shape (N, 2)
+    all_times = jnp.stack([times[:-1], times[1:]], axis=-1)
+
+    return VectorizedSSPTimeQArray(all_times, values, qarray)
 
 
 def modulated(
@@ -734,6 +813,24 @@ class ssTimeQArray(TimeQArray):
         qarray = self.qarray * y
         return replace(self, qarray=qarray)  # ty: ignore[invalid-argument-type]
 
+    def __add__(self, y: TimeQArray) -> TimeQArray:
+        # When adding two compatible ssTimeQArrays (same qarray, no tstart/tend),
+        # promote to VectorizedSSPTimeQArray to avoid O(N) HLO unrolling.
+        if (
+            isinstance(y, ssTimeQArray)
+            and self.tstart is None and self.tend is None
+            and y.tstart is None and y.tend is None
+        ):
+            all_times = jnp.stack(
+                [jnp.stack([self.times[0], self.times[1]]),
+                 jnp.stack([y.times[0], y.times[1]])], axis=0
+            )  # (2, 2)
+            values = jnp.concatenate(
+                [self.values, y.values], axis=-1
+            )  # (..., 2)
+            return VectorizedSSPTimeQArray(all_times, values, self.qarray)
+        return super().__add__(y)
+
 class PWCTimeQArray(TimeQArray):
     # note: tstart and tend can be different from times[0] and times[-1]
 
@@ -829,6 +926,138 @@ class PWCTimeQArray(TimeQArray):
     def __mul__(self, y: QArrayLike) -> TimeQArray:
         qarray = self.qarray * y
         return replace(self, qarray=qarray)  # ty: ignore[invalid-argument-type]
+
+
+class VectorizedSSPTimeQArray(TimeQArray):
+    """Sum of N square pulses stored as stacked arrays, evaluated via a single
+    parallel reduction. O(1) compiled code size for any N.
+
+    Attributes:
+        all_times (Array): shape (N, 2) — [tstart_k, tend_k] for each pulse k.
+        values (Array): shape (..., N) — scalar prefactor for each pulse k.
+        qarray (QArray): shape (n, n) — shared base operator.
+    """
+
+    all_times: Array  # (N, 2)
+    values: Array     # (..., N)
+    qarray: QArray    # (n, n)
+
+    def __init__(
+        self,
+        all_times: Array,
+        values: Array,
+        qarray: QArray,
+        *,
+        tstart: float | None = None,
+        tend: float | None = None,
+    ):
+        super().__init__(tstart=tstart, tend=tend)
+        self.all_times = all_times
+        self.values = values
+        self.qarray = qarray
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return self.qarray.dtype
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return *self.values.shape[:-1], *self.qarray.shape
+
+    @property
+    def dims(self) -> tuple[int, ...]:
+        return self.qarray.dims
+
+    @property
+    def ndiags(self) -> int:
+        return self.qarray.ndiags
+
+    @property
+    def vectorized(self) -> bool:
+        return self.qarray.vectorized
+
+    @property
+    def layout(self) -> Layout:
+        return self.qarray.layout
+
+    @property
+    def mT(self) -> TimeQArray:
+        qarray = self.qarray.mT
+        return replace(self, qarray=qarray)  # ty: ignore[invalid-argument-type]
+
+    @property
+    def in_axes(self) -> PyTree[int | None]:
+        return VectorizedSSPTimeQArray(None, 0, None, tstart=None, tend=None)
+
+    @property
+    def discontinuity_ts(self) -> Array:
+        # all pulse boundaries are discontinuities
+        return concatenate_sort(super().discontinuity_ts, self.all_times.ravel())
+
+    def shift(self, tshift: float) -> TimeQArray:
+        tstart, tend = self._shift_bounds(tshift)
+        return replace(
+            self, all_times=self.all_times + tshift, tstart=tstart, tend=tend
+        )  # ty: ignore[invalid-argument-type]
+
+    def reshape(self, *shape: int) -> TimeQArray:
+        batch_shape = shape[:-2] + self.values.shape[-1:]  # (..., N)
+        values = self.values.reshape(*batch_shape)
+        return replace(self, values=values)  # ty: ignore[invalid-argument-type]
+
+    def broadcast_to(self, *shape: int) -> TimeQArray:
+        batch_shape = shape[:-2] + self.values.shape[-1:]  # (..., N)
+        values = jnp.broadcast_to(self.values, batch_shape)
+        return replace(self, values=values)  # ty: ignore[invalid-argument-type]
+
+    def conj(self) -> TimeQArray:
+        values = self.values.conj()
+        qarray = self.qarray.conj()
+        return replace(self, values=values, qarray=qarray)  # ty: ignore[invalid-argument-type]
+
+    def _prefactor(self, t: ScalarLike) -> Array:
+        # all_times[:, 0] = left bounds (N,), all_times[:, 1] = right bounds (N,)
+        # active shape: (N,) — True for the pulse whose window contains t
+        active = (t >= self.all_times[:, 0]) & (t < self.all_times[:, 1])
+        # values (..., N) * active (N,) — broadcast, then sum over pulses → (...)
+        prefactor = jnp.sum(self.values * active, axis=-1)
+        return super()._prefactor(t) * prefactor
+
+    def _operator(self, t: ScalarLike) -> QArray:  # noqa: ARG002
+        return self.qarray
+
+    def __mul__(self, y: QArrayLike) -> TimeQArray:
+        qarray = self.qarray * y
+        return replace(self, qarray=qarray)  # ty: ignore[invalid-argument-type]
+
+    def __add__(self, y: TimeQArray) -> TimeQArray:
+        # Absorb another ssTimeQArray or VectorizedSSPTimeQArray with the same
+        # qarray into self by appending to the stacked arrays.
+        if (
+            isinstance(y, ssTimeQArray)
+            and self.tstart is None and self.tend is None
+            and y.tstart is None and y.tend is None
+        ):
+            new_times = jnp.concatenate(
+                [self.all_times, y.times[None, :]], axis=0
+            )  # (N+1, 2)
+            new_values = jnp.concatenate(
+                [self.values, y.values], axis=-1
+            )  # (..., N+1)
+            return replace(self, all_times=new_times, values=new_values)  # ty: ignore[invalid-argument-type]
+        if (
+            isinstance(y, VectorizedSSPTimeQArray)
+            and self.tstart is None and self.tend is None
+            and y.tstart is None and y.tend is None
+        ):
+            new_times = jnp.concatenate(
+                [self.all_times, y.all_times], axis=0
+            )  # (N+M, 2)
+            new_values = jnp.concatenate(
+                [self.values, y.values], axis=-1
+            )  # (..., N+M)
+            return replace(self, all_times=new_times, values=new_values)  # ty: ignore[invalid-argument-type]
+        return super().__add__(y)
 
 
 class ModulatedTimeQArray(TimeQArray):
