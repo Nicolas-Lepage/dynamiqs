@@ -36,7 +36,7 @@ PARAMS = {
     "time_of_flight_pump": 0.22,
 }
 
-TSAVE = jnp.linspace(2.0, 2.2, 10)
+TSAVE = jnp.linspace(0.0, 3.0, 1000)
 
 
 def build_model(params):
